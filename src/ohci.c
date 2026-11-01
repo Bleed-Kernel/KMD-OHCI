@@ -14,6 +14,8 @@
 
 #define MMIO(paddr)  ((uint64_t)(paddr) + g_gbi.hhdm_offset)
 
+_Static_assert(sizeof(ohci_dma_t) <= PAGE_SIZE_4K, "ohci dma structures outgrew their page");
+
 static ohci_hc_t ohci_controllers[OHCI_MAX_CONTROLLERS];
 static int       ohci_count = 0;
 static bool      ohci_ready = false;
@@ -32,14 +34,17 @@ static inline uint32_t ohci_phys(ohci_hc_t *hc, const void *ptr) {
     return (uint32_t)(hc->dma_phys + ((uintptr_t)ptr - (uintptr_t)hc->dma));
 }
 
-static void ohci_td_fill(ohci_hc_t *hc, ohci_td_t *td, uint32_t flags,
-                         const void *buf, uint16_t len, ohci_td_t *next) {
-    uint32_t buf_phys = len ? ohci_phys(hc, buf) : 0;
-
+static void ohci_td_set(ohci_hc_t *hc, ohci_td_t *td, uint32_t flags,
+                        uint32_t buf_phys, uint16_t len, ohci_td_t *next) {
     td->info = flags | OHCI_TD_CC_NOT_ACCESSED;
     td->cbp  = buf_phys;
     td->be   = len ? buf_phys + len - 1 : 0;
     td->next = ohci_phys(hc, next);
+}
+
+static void ohci_td_fill(ohci_hc_t *hc, ohci_td_t *td, uint32_t flags,
+                         const void *buf, uint16_t len, ohci_td_t *next) {
+    ohci_td_set(hc, td, flags, len ? ohci_phys(hc, buf) : 0, len, next);
 }
 
 // queue the next IN on an interrupt endpoint.
@@ -87,6 +92,16 @@ static void ohci_td_retired(ohci_hc_t *hc, uint32_t index) {
         hc->ctrl_retired |= 1u << index;
         if (cc != OHCI_CC_NOERROR && !hc->ctrl_cc)
             hc->ctrl_cc = cc;
+        return;
+    }
+
+    if (index >= OHCI_TD_BULK_BASE) {
+        ohci_bulk_t *bulk = &hc->bulks[(index - OHCI_TD_BULK_BASE) / 2];
+        if (!bulk->used || !bulk->busy || td != bulk->td)
+            return;
+        bulk->cc   = cc;
+        bulk->cbp  = td->cbp;
+        bulk->busy = false;
         return;
     }
 
@@ -144,11 +159,8 @@ static int ohci_control_wait(ohci_hc_t *hc, int last_td) {
     }
 }
 
-// setup -> (data) -> status, all on endpoint 0.
-// not safe against itself, only ever called while probing with interrupts off
-static int ohci_control(usb_device_t *dev, const usb_setup_t *setup, void *data) {
-    if (!dev || !dev->hc || !setup) return USB_ERR;
-
+// setup -> (data) -> status, all on endpoint 0
+static int ohci_control_run(usb_device_t *dev, const usb_setup_t *setup, void *data) {
     ohci_hc_t  *hc  = dev->hc;
     ohci_dma_t *dma = hc->dma;
     ohci_ed_t  *ed  = &dma->eds[OHCI_ED_CONTROL];
@@ -201,7 +213,9 @@ static int ohci_control(usb_device_t *dev, const usb_setup_t *setup, void *data)
         // to notice the skip then sweep up whatever it retired
         usb_delay_ms(2);
         ohci_collect_done(hc);
-        return r;
+        serial_printf(LOG_INFO "ohci: control %02x:%02x to address %u failed (%d), cc=%u\n",
+                      setup->request_type, setup->request, dev->address, r, hc->ctrl_cc);
+        return hc->ctrl_cc == OHCI_CC_STALL ? USB_ERR_STALL : r;
     }
 
     if (!len)
@@ -212,6 +226,19 @@ static int ohci_control(usb_device_t *dev, const usb_setup_t *setup, void *data)
     if (in)
         memcpy(data, dma->ctrl_buf, got);
     return got;
+}
+
+// interrupts stay off so whoever holds this cant get preempted by usb_service spinning on it
+static int ohci_control(usb_device_t *dev, const usb_setup_t *setup, void *data) {
+    if (!dev || !dev->hc || !setup) return USB_ERR;
+    ohci_hc_t *hc = dev->hc;
+
+    unsigned long irq = irq_push();
+    spinlock_acquire(&hc->ctrl_lock);
+    int r = ohci_control_run(dev, setup, data);
+    spinlock_release(&hc->ctrl_lock);
+    irq_restore(irq);
+    return r;
 }
 
 static int ohci_interrupt_in(usb_device_t *dev, const usb_endpoint_desc_t *ep,
@@ -253,11 +280,167 @@ static int ohci_interrupt_in(usb_device_t *dev, const usb_endpoint_desc_t *ep,
     return USB_ERR;
 }
 
-// no bulk list yet, mass storage on these controllers logs that and moves on
+static ohci_bulk_t *ohci_bulk_find(ohci_hc_t *hc, usb_device_t *dev, uint8_t endpoint) {
+    for (int i = 0; i < OHCI_MAX_BULK; i++) {
+        ohci_bulk_t *bulk = &hc->bulks[i];
+        if (bulk->used && bulk->dev == dev && bulk->endpoint == endpoint)
+            return bulk;
+    }
+    return NULL;
+}
+
+static int ohci_bulk_open(usb_device_t *dev, const usb_endpoint_desc_t *ep,
+                          const usb_ss_companion_desc_t *ss) {
+    (void)ss;
+    if (!dev || !dev->hc || !ep) return USB_ERR;
+    ohci_hc_t *hc         = dev->hc;
+    uint16_t   max_packet = ep->max_packet & USB_ENDPOINT_MPS_MASK;
+
+    if (!max_packet) return USB_ERR;
+    if (ohci_bulk_find(hc, dev, ep->address)) return 0;
+
+    for (int i = 0; i < OHCI_MAX_BULK; i++) {
+        ohci_bulk_t *bulk = &hc->bulks[i];
+        if (bulk->used) continue;
+
+        bulk->dev        = dev;
+        bulk->endpoint   = ep->address;
+        bulk->max_packet = max_packet;
+        bulk->ed         = &hc->dma->eds[OHCI_ED_BULK_BASE + i];
+        bulk->td         = &hc->dma->tds[OHCI_TD_BULK_BASE + i * 2];
+        bulk->tail       = &hc->dma->tds[OHCI_TD_BULK_BASE + i * 2 + 1];
+        bulk->busy       = false;
+        bulk->used       = true;
+
+        // head == tail means empty, the info write is what takes the skip off
+        bulk->ed->head = ohci_phys(hc, bulk->tail);
+        bulk->ed->tail = ohci_phys(hc, bulk->tail);
+        bulk->ed->info = OHCI_ED_FA(dev->address)
+                       | OHCI_ED_EN(ep->address & USB_ENDPOINT_NUM_MASK)
+                       | ((ep->address & USB_ENDPOINT_IN) ? OHCI_ED_DIR_IN : OHCI_ED_DIR_OUT)
+                       | OHCI_ED_MPS(max_packet);
+
+        serial_printf(LOG_INFO "ohci: bulk endpoint 0x%02x open on address %u, max packet %u\n",
+                      ep->address, dev->address, max_packet);
+        return 0;
+    }
+
+    serial_printf(LOG_WARN "ohci: out of bulk endpoints\n");
+    return USB_ERR;
+}
+
+// pull a td back off a live ed, the toggle carry stays for whoever goes next
+static void ohci_bulk_abort(ohci_hc_t *hc, ohci_bulk_t *bulk) {
+    bulk->ed->info |= OHCI_ED_SKIP;
+    usb_delay_ms(2);
+    ohci_collect_done(hc);
+
+    bulk->busy     = false;
+    bulk->ed->head = (bulk->ed->head & OHCI_ED_HEAD_CARRY) | ohci_phys(hc, bulk->tail);
+    bulk->ed->info &= ~OHCI_ED_SKIP;
+}
+
+// one td at a time. a short read off a queue of them halts the ed and the next td
+// would swallow the CSW, this way the short one just ends the transfer
+static int ohci_bulk_td(ohci_hc_t *hc, ohci_bulk_t *bulk, uint32_t phys, uint16_t len) {
+    bool       in    = bulk->endpoint & USB_ENDPOINT_IN;
+    ohci_td_t *td    = bulk->tail;
+    ohci_td_t *spare = bulk->td;
+
+    ohci_td_set(hc, td, (in ? OHCI_TD_DP_IN | OHCI_TD_ROUNDING : OHCI_TD_DP_OUT)
+                        | OHCI_TD_DI_NOW | OHCI_TD_TOGGLE_ED, phys, len, spare);
+
+    bulk->td   = td;
+    bulk->tail = spare;
+    bulk->busy = true;
+    bulk->ed->tail = ohci_phys(hc, spare);
+    ohci_write(hc->base, OHCI_REG_CMDSTATUS, OHCI_CMD_BLF);
+
+    uint64_t start = hpet_get_femtoseconds();
+    for (uint64_t spins = 0; bulk->busy; spins++) {
+        ohci_collect_done(hc);
+        if (!bulk->busy)
+            break;
+
+        if (bulk->dev->gone) {
+            ohci_bulk_abort(hc, bulk);
+            return USB_ERR_GONE;
+        }
+        if (usb_timed_out(start, spins, OHCI_BULK_TIMEOUT_MS)) {
+            serial_printf(LOG_WARN "ohci: bulk 0x%02x timed out on %u bytes, ed head=0x%08x\n",
+                          bulk->endpoint, len, bulk->ed->head);
+            ohci_bulk_abort(hc, bulk);
+            return USB_ERR_TIMEOUT;
+        }
+        asm volatile("pause");
+    }
+
+    if (bulk->cc != OHCI_CC_NOERROR) {
+        serial_printf(LOG_WARN "ohci: bulk 0x%02x failed on %u bytes, cc=%u\n",
+                      bulk->endpoint, len, bulk->cc);
+        bulk->ed->head &= ~OHCI_ED_HEAD_HALTED;
+        return bulk->cc == OHCI_CC_STALL ? USB_ERR_STALL : USB_ERR;
+    }
+
+    return bulk->cbp ? (int)(bulk->cbp - phys) : len;
+}
+
+static int ohci_bulk(usb_device_t *dev, uint8_t endpoint, void *buf, size_t len) {
+    if (!dev || !dev->hc || !buf) return USB_ERR;
+    ohci_hc_t   *hc   = dev->hc;
+    ohci_bulk_t *bulk = ohci_bulk_find(hc, dev, endpoint);
+    if (!bulk) return USB_ERR;
+
+    paddr_t phys = vaddr_to_paddr(buf);
+    if (len && (((uint64_t)phys + len - 1) >> 32)) {
+        serial_printf(LOG_ERROR "ohci: bulk buffer is above 4G (0x%llx)\n", (uint64_t)phys);
+        return USB_ERR;
+    }
+
+    size_t moved = 0;
+    while (moved < len) {
+        size_t left  = len - moved;
+        size_t chunk = OHCI_TD_MAX_LEN - ((uint32_t)phys & (OHCI_TD_PAGE - 1));
+
+        // only the very last packet of a transfer is allowed to be short
+        if (chunk >= left)
+            chunk = left;
+        else
+            chunk -= chunk % bulk->max_packet;
+
+        int r = ohci_bulk_td(hc, bulk, (uint32_t)phys, (uint16_t)chunk);
+        if (r < 0)
+            return r;
+
+        moved += (size_t)r;
+        phys  += (size_t)r;
+        if ((size_t)r < chunk)
+            break;
+    }
+    return (int)moved;
+}
+
+// the device restarts on DATA0 after a clear halt so the carry goes too
+static int ohci_reset_endpoint(usb_device_t *dev, uint8_t endpoint) {
+    if (!dev || !dev->hc) return USB_ERR;
+    ohci_hc_t   *hc   = dev->hc;
+    ohci_bulk_t *bulk = ohci_bulk_find(hc, dev, endpoint);
+    if (!bulk) return USB_ERR;
+
+    bulk->ed->info |= OHCI_ED_SKIP;
+    usb_delay_ms(2);
+    bulk->ed->head = ohci_phys(hc, bulk->tail);
+    bulk->ed->info &= ~OHCI_ED_SKIP;
+    return 0;
+}
+
 static const usb_hc_ops_t ohci_ops = {
-    .name         = "ohci",
-    .control      = ohci_control,
-    .interrupt_in = ohci_interrupt_in,
+    .name           = "ohci",
+    .control        = ohci_control,
+    .interrupt_in   = ohci_interrupt_in,
+    .bulk_open      = ohci_bulk_open,
+    .bulk           = ohci_bulk,
+    .reset_endpoint = ohci_reset_endpoint,
 };
 
 static bool ohci_port_reset(ohci_hc_t *hc, uint8_t port, bool *low_speed) {
@@ -313,10 +496,6 @@ static usb_device_t *ohci_free_device(ohci_hc_t *hc) {
 }
 
 static void ohci_port_enumerate(ohci_hc_t *hc, uint8_t port) {
-    bool low_speed = false;
-    if (!ohci_port_reset(hc, port, &low_speed))
-        return;
-
     usb_device_t *dev     = ohci_free_device(hc);
     uint8_t       address = ohci_free_address(hc);
     if (!dev || !address) {
@@ -329,13 +508,25 @@ static void ohci_port_enumerate(ohci_hc_t *hc, uint8_t port) {
     dev->ops         = &ohci_ops;
     dev->hc          = hc;
     dev->port        = port;
-    dev->speed       = low_speed ? USB_SPEED_LOW : USB_SPEED_FULL;
     dev->max_packet0 = 8;
 
-    // only the first 8 bytes are safe to ask for until we know how big ep0 packets are
+    // only the first 8 bytes are safe to ask for until we know how big ep0 packets are.
+    // some sticks need a second reset, the same retry every other os does
     usb_device_desc_t desc;
-    memset(&desc, 0, sizeof(desc));
-    if (usb_get_descriptor(dev, USB_DESC_DEVICE, &desc, 8) < 8) {
+    bool answered = false;
+    for (int attempt = 0; attempt < OHCI_ENUM_TRIES && !answered; attempt++) {
+        bool low_speed = false;
+        if (!ohci_port_reset(hc, port, &low_speed))
+            break;
+
+        dev->speed = low_speed ? USB_SPEED_LOW : USB_SPEED_FULL;
+        memset(&desc, 0, sizeof(desc));
+        answered = usb_get_descriptor(dev, USB_DESC_DEVICE, &desc, 8) >= 8;
+        if (!answered)
+            serial_printf(LOG_INFO "ohci: port %u no answer on try %d, status=0x%08x\n", port, attempt + 1,
+                          ohci_read(hc->base, OHCI_REG_RH_PORT + (uint32_t)port * 4));
+    }
+    if (!answered) {
         serial_printf(LOG_WARN "ohci: port %u device isnt answering\n", port);
         memset(dev, 0, sizeof(*dev));
         return;
@@ -368,6 +559,10 @@ static void ohci_port_detach(ohci_hc_t *hc, uint8_t port) {
         if (hc->pipes[i].used && hc->pipes[i].dev == dev)
             hc->pipes[i].ed->info |= OHCI_ED_SKIP;
     }
+    for (int i = 0; i < OHCI_MAX_BULK; i++) {
+        if (hc->bulks[i].used && hc->bulks[i].dev == dev)
+            hc->bulks[i].ed->info |= OHCI_ED_SKIP;
+    }
     usb_delay_ms(2);
 
     unsigned long irq = irq_push();
@@ -376,6 +571,12 @@ static void ohci_port_detach(ohci_hc_t *hc, uint8_t port) {
         if (hc->pipes[i].used && hc->pipes[i].dev == dev) {
             hc->pipes[i].used = false;
             hc->pipes[i].dev  = NULL;
+        }
+    }
+    for (int i = 0; i < OHCI_MAX_BULK; i++) {
+        if (hc->bulks[i].used && hc->bulks[i].dev == dev) {
+            hc->bulks[i].used = false;
+            hc->bulks[i].dev  = NULL;
         }
     }
     memset(dev, 0, sizeof(*dev));
@@ -449,6 +650,7 @@ static bool ohci_controller_init(ohci_hc_t *hc, const pci_device_t *pci_dev) {
     hc->dma_phys     = dma_phys;
     hc->dma          = (ohci_dma_t *)(uintptr_t)MMIO(dma_phys);
     spinlock_init(&hc->lock);
+    spinlock_init(&hc->ctrl_lock);
     memset(hc->dma, 0, sizeof(*hc->dma));
 
     ohci_dma_t *dma = hc->dma;
@@ -457,7 +659,9 @@ static bool ohci_controller_init(ohci_hc_t *hc, const pci_device_t *pci_dev) {
     // the interrupt ones are chained up front so the list never gets relinked under the controller
     for (int i = 0; i < OHCI_ED_COUNT; i++)
         dma->eds[i].info = OHCI_ED_SKIP;
-    for (int i = OHCI_ED_PIPE_BASE; i < OHCI_ED_COUNT - 1; i++)
+    for (int i = OHCI_ED_PIPE_BASE; i < OHCI_ED_BULK_BASE - 1; i++)
+        dma->eds[i].next = ohci_phys(hc, &dma->eds[i + 1]);
+    for (int i = OHCI_ED_BULK_BASE; i < OHCI_ED_COUNT - 1; i++)
         dma->eds[i].next = ohci_phys(hc, &dma->eds[i + 1]);
 
     // the table is indexed by frame number & 31, so every 8th slot = every 8ms
@@ -484,7 +688,7 @@ static bool ohci_controller_init(ohci_hc_t *hc, const pci_device_t *pci_dev) {
     ohci_write(base, OHCI_REG_HCCA,         ohci_phys(hc, &dma->hcca));
     ohci_write(base, OHCI_REG_CONTROL_HEAD, ohci_phys(hc, &dma->eds[OHCI_ED_CONTROL]));
     ohci_write(base, OHCI_REG_CONTROL_CUR,  0);
-    ohci_write(base, OHCI_REG_BULK_HEAD,    0);
+    ohci_write(base, OHCI_REG_BULK_HEAD,    ohci_phys(hc, &dma->eds[OHCI_ED_BULK_BASE]));
     ohci_write(base, OHCI_REG_BULK_CUR,     0);
 
     // largest packet that still fits in whats left of a frame, formula is from the spec
@@ -493,7 +697,7 @@ static bool ohci_controller_init(ohci_hc_t *hc, const pci_device_t *pci_dev) {
     ohci_write(base, OHCI_REG_FM_INTERVAL,    fit | (fsmps << 16) | fi);
     ohci_write(base, OHCI_REG_PERIODIC_START, (fi * 9) / 10);
 
-    ohci_write(base, OHCI_REG_CONTROL, OHCI_CTRL_HCFS_OPER | OHCI_CTRL_CLE
+    ohci_write(base, OHCI_REG_CONTROL, OHCI_CTRL_HCFS_OPER | OHCI_CTRL_CLE | OHCI_CTRL_BLE
                                        | OHCI_CTRL_PLE | OHCI_CTRL_CBSR_4_1);
     ohci_write(base, OHCI_REG_INT_STATUS, 0x7FFFFFFF);
 

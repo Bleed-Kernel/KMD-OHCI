@@ -17,6 +17,7 @@
 #define OHCI_MAX_PORTS          15
 #define OHCI_MAX_DEVICES        8
 #define OHCI_MAX_PIPES          8   // interrupt endpoints per controller
+#define OHCI_MAX_BULK           8   // bulk endpoints per controller
 
 // operational register offsets
 #define OHCI_REG_REVISION       0x00
@@ -41,6 +42,7 @@
 #define OHCI_CTRL_CBSR_4_1      (3u << 0)   // control:bulk service ratio
 #define OHCI_CTRL_PLE           (1u << 2)   // periodic list enable
 #define OHCI_CTRL_CLE           (1u << 4)   // control list enable
+#define OHCI_CTRL_BLE           (1u << 5)   // bulk list enable
 #define OHCI_CTRL_HCFS_MASK     (3u << 6)
 #define OHCI_CTRL_HCFS_RESET    (0u << 6)
 #define OHCI_CTRL_HCFS_OPER     (2u << 6)
@@ -50,6 +52,7 @@
 // HcCommandStatus
 #define OHCI_CMD_HCR            (1u << 0)   // host controller reset
 #define OHCI_CMD_CLF            (1u << 1)   // control list filled
+#define OHCI_CMD_BLF            (1u << 2)   // bulk list filled
 #define OHCI_CMD_OCR            (1u << 3)   // ownership change request
 
 // HcInterruptStatus / Enable / Disable
@@ -83,6 +86,7 @@
 #define OHCI_ED_FA(a)           ((uint32_t)(a) & 0x7F)
 #define OHCI_ED_EN(n)           (((uint32_t)(n) & 0xF) << 7)
 #define OHCI_ED_DIR_TD          (0u << 11)  // direction comes from each TD
+#define OHCI_ED_DIR_OUT         (1u << 11)
 #define OHCI_ED_DIR_IN          (2u << 11)
 #define OHCI_ED_LOWSPEED        (1u << 13)
 #define OHCI_ED_SKIP            (1u << 14)
@@ -112,10 +116,14 @@
 #define OHCI_HANDOFF_TIMEOUT_MS 1000
 #define OHCI_PORT_RESET_MS      100
 #define OHCI_CTRL_TIMEOUT_MS    500
+#define OHCI_BULK_TIMEOUT_MS    5000    // a cold usb stick can sit on a read for a while
+#define OHCI_ENUM_TRIES         3       // resets a device gets to answer its first descriptor read
 #define OHCI_PIPE_MAX_ERRORS    8       // strikes before we decide a device is gone
 #define OHCI_DEBOUNCE_MS        100     // usb2 spec wants 100ms between attach and reset
 
 #define OHCI_POLL_FRAMES        8       // interrupt endpoints get serviced every 8ms
+#define OHCI_TD_PAGE            0x1000u
+#define OHCI_TD_MAX_LEN         (OHCI_TD_PAGE * 2)  // a td can only cross one page boundary
 
 // everything in here is touched by the controller behind our back, hence the volatile
 typedef struct ohci_ed {
@@ -140,18 +148,20 @@ typedef struct ohci_hcca {
     uint8_t           reserved[116];
 } __attribute__((aligned(256))) ohci_hcca_t;
 
-// td pool layout, the control endpoint owns the first 4 and each pipe gets a pair
+// td pool layout, the control endpoint owns the first 4 and each pipe or bulk endpoint gets a pair
 #define OHCI_TD_SETUP           0
 #define OHCI_TD_DATA            1
 #define OHCI_TD_STATUS          2
 #define OHCI_TD_CTRL_TAIL       3
 #define OHCI_TD_PIPE_BASE       4
-#define OHCI_TD_COUNT           (OHCI_TD_PIPE_BASE + OHCI_MAX_PIPES * 2)
+#define OHCI_TD_BULK_BASE       (OHCI_TD_PIPE_BASE + OHCI_MAX_PIPES * 2)
+#define OHCI_TD_COUNT           (OHCI_TD_BULK_BASE + OHCI_MAX_BULK * 2)
 
 // ed pool layout
 #define OHCI_ED_CONTROL         0
 #define OHCI_ED_PIPE_BASE       1
-#define OHCI_ED_COUNT           (OHCI_ED_PIPE_BASE + OHCI_MAX_PIPES)
+#define OHCI_ED_BULK_BASE       (OHCI_ED_PIPE_BASE + OHCI_MAX_PIPES)
+#define OHCI_ED_COUNT           (OHCI_ED_BULK_BASE + OHCI_MAX_BULK)
 
 #define OHCI_PIPE_BUF_SIZE      64
 
@@ -179,6 +189,19 @@ typedef struct ohci_pipe {
     void              *ctx;
 } ohci_pipe_t;
 
+typedef struct ohci_bulk {
+    bool               used;
+    usb_device_t      *dev;
+    uint8_t            endpoint;
+    uint16_t           max_packet;
+    ohci_ed_t         *ed;
+    ohci_td_t         *td;      // the one the controller is working on
+    ohci_td_t         *tail;    // spare, swaps with td every transfer
+    volatile bool      busy;
+    volatile uint32_t  cc;      // what the td finished with
+    volatile uint32_t  cbp;
+} ohci_bulk_t;
+
 typedef struct ohci_hc {
     bool         present;
     uint64_t     base;          // vaddr of the OHCI MMIO base
@@ -187,10 +210,12 @@ typedef struct ohci_hc {
     uint8_t      port_count;
 
     spinlock_t   lock;
+    spinlock_t   ctrl_lock;     // one control transfer at a time, there is one ed for all of them
     uint32_t     ctrl_retired;  // bitmask of control TDs the controller has handed back
     uint32_t     ctrl_cc;       // first bad condition code seen, 0 if clean
 
     ohci_pipe_t  pipes[OHCI_MAX_PIPES];
+    ohci_bulk_t  bulks[OHCI_MAX_BULK];
     usb_device_t devices[OHCI_MAX_DEVICES];
     usb_device_t *port_dev[OHCI_MAX_PORTS];
 } ohci_hc_t;
